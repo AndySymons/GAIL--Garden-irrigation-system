@@ -1,0 +1,417 @@
+### ------------------------------------------------------------------------------------
+###
+###      GARDEN IRRIGATION USING ORBIT B-HYVE
+###      ------ ---------- ----- ----- ------
+###
+### Controls one or more zones based on a correspnding nummber of soil sensors and parameter lists
+### This version is specific to Orbit B-Hyve products as it uses the Orbit B-Hyve integration services
+### A simple switch-based version could be made by replacing bhyve.start_watering with switch.turn_on and bhyve.stop_watering with switch.turn_off
+###
+### 21-Jul-24 | Andy Symons | First working version
+### 30-Jul-24 | Andy Symons | Modified the 'maximum time' log message to include the timeout value used
+### 23-Sep-24 | Andy Symons | Added zone control valve type selector (Switch or B-Hyve)
+###
+### ------------------------------------------------------------------------------------
+
+blueprint:
+  name: Garden Irrigation
+  description: Automatically waters a garden, one zone at a time, every day
+    after sunset. Only waters if moisture content is below the set threshold (it has not rained)
+    and insufficient rain is forecast for the next day.
+    Waters until soil moisture content is reaches the target, or to a set maximum time (whichever occurs first).
+    Default time used if the sensor is not working.
+
+  domain: automation
+
+  input:
+    zone_control_valve_type:
+      name: Zone irrigation control valve type
+      description: Can be an ordinary smart switch or an Orbit B-Hyve controller
+      selector:
+        select:
+          options:
+            - Switch
+            - B-Hyve
+      default: Switch
+
+    zone_switches:
+      name: Zone watering switches
+      description: List the switches that turn on the water for each watering zone
+      selector:
+        entity:
+          filter:
+            domain: switch
+          multiple: true
+
+    zone_moisture_sensors:
+      name: Zone soil moisture sensors
+      description: List the soil moisture sensors for each zone in the same order as the zone switches
+      selector:
+        entity:
+          filter:
+            domain: sensor
+          multiple: true
+
+    zone_moisture_thresholds:
+      name: Zone soil moisture threshold (lower) levels for watering
+      description: List the input_number helpers containing the soil moisture level above which watering will not start as a percentage. Enter one for each zone in the same order as the zone switches
+      selector:
+        entity:
+          filter:
+            domain: input_number
+          multiple: true
+
+    zone_moisture_targets:
+      name: Zone soil moisture target (upper) level for watering
+      description: List the input_number helpers containing the soil moisture level at which automatic watering will stop as a percentage. Enter one for each zone in the same order as the zone switches
+      selector:
+        entity:
+          filter:
+            domain: input_number
+          multiple: true
+
+    zone_maximum_watering_times:
+      name: Zone maximum watering times
+      description: List the input_number helpers containing the maximum time for watering each zone in minutes. Enter one for each zone in the same order as the zone switches
+      selector:
+        entity:
+          filter:
+            domain: input_number
+          multiple: true
+
+    zone_default_watering_times:
+      name: Zone default watering times
+      description: List the input_number helpers containing the time to use if the soil moisture sensor does not work, in minutes. Enter one for each zone in the same order as the zone switches
+      selector:
+        entity:
+          filter:
+            domain: input_number
+          multiple: true
+
+    irrigation_timer:
+      name: Irrigation timer
+      description: The timer helper to use for timing-out the watering
+      selector:
+        entity:
+          filter:
+            domain: timer
+          multiple: false
+
+    weather_forecast_service:
+      name: Weather forecast service
+      description: Any weather forecast service that includes daily forecaasts of precipitation for the garden's location
+      selector:
+        entity:
+          filter:
+            domain: weather
+          multiple: false
+
+    minimum_forecast_precipitation:
+      name: Minimum forecast precipitation
+      description: The minimum precipitation forecast for tomorrow for which watering is not necessary
+      selector:
+        number:
+          min: 10
+          max: 200
+          unit_of_measurement: "mm"
+      default: 25
+
+    logfile_notification_service:
+      name: logfile_motification_service
+      description: Optional logging service name. Leave blank if no logging required.
+      selector:
+        text:
+      default: ""
+
+mode: single
+
+variables:
+  input_irrigation_timer: !input irrigation_timer
+  input_minimum_forecast_precipitation: !input minimum_forecast_precipitation
+  input_zone_control_valve_type: !input zone_control_valve_type
+  input_zone_default_watering_times: !input zone_default_watering_times
+  input_zone_maximum_watering_times: !input zone_maximum_watering_times
+  input_zone_moisture_sensors: !input zone_moisture_sensors
+  input_zone_moisture_targets: !input zone_moisture_targets
+  input_zone_moisture_thresholds: !input zone_moisture_thresholds
+  input_zone_switches: !input zone_switches
+  log_message_preamble: >
+    {{ this.attributes.friendly_name }}
+
+trigger:
+  - platform: sun
+    event: sunset
+    offset: 00:30:00
+
+condition: []
+
+action:
+  # ACTION[0]
+  # Log the header
+  - service: script.logfile_entry
+    data:
+      notification_service: !input logfile_notification_service
+      logfile_title: Garden Irrigation
+      message_preamble: >
+        {{ log_message_preamble }}
+      message_body: >
+        {{ "---------------------------------" }}
+
+  # ACTION[1]
+  # Stop if soil moisture content is above the threshold for all zones
+  - if:
+      - condition: template
+        value_template: >
+          {%- set ns = namespace(all_above_min = true) %}
+          {%- for sensor in input_zone_moisture_sensors %}
+            {%- if states(sensor) | int(0) < states(input_zone_moisture_thresholds[input_zone_moisture_sensors.index(sensor)]) | int(100) %}
+              {%- set ns.all_above_min= false %}   
+            {%- endif %}
+          {%- endfor %}
+          {{ ns.all_above_min }}
+    then:
+      - service: script.logfile_entry
+        data:
+          notification_service: !input logfile_notification_service
+          logfile_title: Garden Irrigation
+          message_preamble: >
+            {{ log_message_preamble }}
+          message_body: >
+            {{ "Garden not watered because soil moisture is already at least the threshold for all zones" }}
+      - stop: "Garden not watered because soil moisture is already at least the threshold for all zones"
+
+  # ACTION[2]
+  # Get the weather forecast
+  - service: weather.get_forecasts
+    data:
+      type: daily
+    target:
+      entity_id: !input weather_forecast_service
+    response_variable: daily_forecast
+
+  # ACTION[3]
+  # Stop if over 25mm rain expected tomorrow
+  - if:
+      - condition: template
+        value_template: >
+          {{ daily_forecast['weather.forecast_home'].forecast[1].precipitation > input_minimum_forecast_precipitation }}
+    then:
+      - service: script.logfile_entry
+        data:
+          notification_service: !input logfile_notification_service
+          logfile_title: Garden Irrigation
+          message_preamble: >
+            {{ log_message_preamble }}
+          message_body: >
+            {% set forecast_precipitation = daily_forecast['weather.forecast_home'].forecast[1].precipitation %}
+            {{ "Garden not watered because " + forecast_precipitation | string + " mm rain is forecast for tomorrow, which is more than the set threshold of " + input_minimum_forecast_precipitation | string + " mm" }}
+      - stop: "Garden not watered because enough rain is forecast for tomorrow"
+
+  # ACTION[4]
+  # Water each zone that is below its threshold moisture level
+  - repeat:
+      for_each: !input zone_switches
+      sequence:
+        - variables:
+            zone_number: >
+              {{ repeat.index }}
+
+        - if:
+            # Current moisture level is already above the threshold
+            - condition: template
+              value_template: >
+                {% set minimum_moisture_level = states(input_zone_moisture_thresholds[zone_number-1]) | int(0) %}
+                {% set current_moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                {{ current_moisture_level > minimum_moisture_level }}
+          then:
+            # Log that zone will not be watered
+            - service: script.logfile_entry
+              data:
+                notification_service: !input logfile_notification_service
+                logfile_title: Garden Irrigation
+                message_preamble: >
+                  {{ log_message_preamble }}
+                message_body: >
+                  {% set minimum_moisture_level = states(input_zone_moisture_thresholds[zone_number-1]) | int(0) %}
+                  {% set current_moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                  {% set friendly_name = state_attr(repeat.item, 'friendly_name') %}
+                  {{ "Zone '" + friendly_name + "' not watered because " + current_moisture_level | string + "% moisture level is already over its threshold of " + minimum_moisture_level | string + "%." }}
+
+          else:
+            # Log the zone start conditions
+            - service: script.logfile_entry
+              data:
+                notification_service: !input logfile_notification_service
+                logfile_title: Garden Irrigation
+                message_preamble: >
+                  {{ log_message_preamble }}
+                message_body: >
+                  {% set current_moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                  {% set moisture_target = states(input_zone_moisture_targets[zone_number-1]) | int(0) %}
+                  {% set friendly_name = state_attr(repeat.item, 'friendly_name') %}
+                  {{ "Started watering zone '" + friendly_name + "'; moisture level = " + current_moisture_level | string + "%. Target level = " + moisture_target | string + "%." }}
+
+            # Start the timeout timer using the default if the soil mosture sensor is not working, otherwise the maximum time
+            - service: timer.start
+              metadata: {}
+              data:
+                duration:
+                  minutes: >
+                    {% if states(input_zone_moisture_sensors[zone_number-1]) | int(0) > 3 %}
+                      {{ states(input_zone_maximum_watering_times[zone_number-1]) | string }}
+                    {% else %}
+                      {{ states(input_zone_default_watering_times[zone_number-1]) | string }}
+                    {% endif %}
+              target:
+                entity_id: !input irrigation_timer
+
+            # Start watering
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ input_zone_control_valve_type == 'Switch' }}
+                  sequence:
+                    - service: switch.turn_on
+                      data:
+                        entity_id: >
+                          {{ input_zone_switches[zone_number-1] }}
+
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ input_zone_control_valve_type == 'B-Hyve' }}
+                  sequence:
+                    # Start watering using time 1 minute more than the automation's own timer
+                    - service: bhyve.start_watering
+                      data:
+                        entity_id: >
+                          {{ input_zone_switches[zone_number-1] }}
+                        minutes: >
+                          {% if states(input_zone_moisture_sensors[zone_number-1]) | int(0) > 3 %}
+                            {{ (states(input_zone_maximum_watering_times[zone_number-1]) | int(0) + 1) | string }}
+                          {% else %}
+                            {{ (states(input_zone_default_watering_times[zone_number-1]) | int(0) + 1) | string }}
+                          {% endif %}
+
+            # Let the controller catch up before testing it is on
+            - delay: 60
+
+            # Continue watering until the soil moisture level reaches the target, or the timer runs out, or it is turned off manually or by the controller
+            - repeat:
+                while:
+                  - condition: template
+                    value_template: >
+                      {% set moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                      {% set moisture_maximum = states(input_zone_moisture_targets[zone_number-1]) | int(0) %}
+                      {{ moisture_level < moisture_maximum }}
+                  - condition: state
+                    entity_id: !input irrigation_timer
+                    state: active
+                  - condition: template
+                    value_template: >
+                      {{ states(input_zone_switches[zone_number-1]) == 'on' }}
+
+                sequence:
+                  # Loop delay
+                  - delay: 60
+
+            # Identify and log the end condition
+            - choose:
+                # Target moisture level reached
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {% set moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                        {% set moisture_maximum = states(input_zone_moisture_targets[zone_number-1]) | int(0) %}
+                        {{ moisture_level >= moisture_maximum }}
+                  sequence:
+                    - service: script.logfile_entry
+                      data:
+                        notification_service: !input logfile_notification_service
+                        logfile_title: Garden Irrigation
+                        message_preamble: >
+                          {{ log_message_preamble }}
+                        message_body: >
+                          {% set friendly_name = state_attr(repeat.item, 'friendly_name') %}                  
+                          {% set moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                          {% set moisture_maximum = states(input_zone_moisture_targets[zone_number-1]) | int(0) %}
+                          {{ "Finished watering zone '" + friendly_name + "'; target moisture level " + moisture_maximum | string + "% reached. (Actual moisture level now = " + moisture_level | string + "%)." }}
+
+                # Time ran out
+                - conditions:
+                    - condition: state
+                      entity_id: !input irrigation_timer
+                      state: idle
+                  sequence:
+                    - service: script.logfile_entry
+                      data:
+                        notification_service: !input logfile_notification_service
+                        logfile_title: Garden Irrigation
+                        message_preamble: >
+                          {{ log_message_preamble }}
+                        message_body: >
+                          {% set friendly_name = state_attr(repeat.item, 'friendly_name') %}                  
+                          {% set moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) | string %}
+                          {% if states(input_zone_moisture_sensors[zone_number-1]) | int(0) > 3 %} 
+                            {% set timeout = states(input_zone_maximum_watering_times[zone_number-1]) | int(0) | string %}
+                          {% else %}
+                            {% set timeout = states(input_zone_default_watering_times[zone_number-1]) | int(0) | string %}
+                          {% endif %}
+                          {{ "Stopped watering zone '" + friendly_name + "' because the time limit of " + timeout  + " minutes was reached. Moisture level = " + moisture_level  + "%." }}
+
+                # Turned off manually or by the controller
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ states(input_zone_switches[zone_number-1]) == 'off' }}
+                  sequence:
+                    - service: script.logfile_entry
+                      data:
+                        notification_service: !input logfile_notification_service
+                        logfile_title: Garden Irrigation
+                        message_preamble: >
+                          {{ log_message_preamble }}
+                        message_body: >
+                          {% set friendly_name = state_attr(repeat.item, 'friendly_name') %}                  
+                          {% set moisture_level = states(input_zone_moisture_sensors[zone_number-1]) | int(0) %}
+                          {{ "Watering zone '" + friendly_name + "' was stopped manually or by the controller. Moisture level = " + moisture_level | string + "%." }}
+
+            # Stop watering
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ input_zone_control_valve_type == 'Switch' }}
+                  sequence:
+                    - service: switch.turn_off
+                      data:
+                        entity_id: >
+                          {{ input_zone_switches[zone_number-1] }}
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ input_zone_control_valve_type == 'B-Hyve' }}
+                  sequence:
+                    - service: bhyve.stop_watering
+                      data:
+                        entity_id: >
+                          {{ input_zone_switches[zone_number-1] }}
+
+            # Stop the timer
+            - service: timer.finish
+              metadata: {}
+              data: {}
+              target:
+                entity_id: !input irrigation_timer
+
+  # ACTION[5]
+  # Log the end of watering
+  - service: script.logfile_entry
+    data:
+      notification_service: !input logfile_notification_service
+      logfile_title: Garden Irrigation
+      message_preamble: >
+        {{ log_message_preamble }}
+      message_body: >
+        {{ "Watering complete." }}
